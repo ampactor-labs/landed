@@ -1,6 +1,16 @@
 # landed
 
+[![Crates.io](https://img.shields.io/crates/v/landed.svg)](https://crates.io/crates/landed)
+[![Documentation](https://docs.rs/landed/badge.svg)](https://docs.rs/landed)
+[![CI](https://github.com/ampactor-labs/landed/actions/workflows/ci.yml/badge.svg)](https://github.com/ampactor-labs/landed/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/landed.svg)](#license)
+
 Fail-closed Solana transaction execution: plan it, gate it, submit it by RPC or Jito bundle, and know what happened.
+
+```toml
+[dependencies]
+landed = "0.1"
+```
 
 ```text
 assemble ──► gate ──► submit ──► track
