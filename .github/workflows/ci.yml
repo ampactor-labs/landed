@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # The point of this crate is that its behavior is proven against a real
+  # validator on every push, not asserted in unit tests alone.
+  validator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Agave toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Start test validator
+        run: |
+          solana-test-validator --quiet --reset --ledger /tmp/test-ledger &
+          for i in $(seq 1 90); do
+            if curl -s http://127.0.0.1:8899 -X POST -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' | grep -q '"ok"'; then
+              echo "validator healthy after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "validator never became healthy" >&2; exit 1
+      - name: Integration tests against the validator
+        run: LANDED_RPC_URL=http://127.0.0.1:8899 cargo test --test validator -- --nocapture
