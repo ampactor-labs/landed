@@ -12,6 +12,8 @@ Fail-closed Solana transaction execution: plan it, gate it, submit it by RPC or 
 landed = "0.1"
 ```
 
+**Status: working, API unstable.** 0.1.0 is on crates.io. Priority fees are not a gate input yet, and an `Expired` flight is the caller's to rebuild.
+
 ```text
 assemble ──► gate ──► submit ──► track
  blockhash    balance   RPC or    signature status
@@ -90,21 +92,29 @@ cargo run --release --example demo -- https://api.devnet.solana.com 25 ~/.config
 
 Poll interval is worth a word, since it is the one knob that can lie to you. The default is 400 ms; at that setting the reported confirm time is the poll granularity rather than the cluster's, which is why the demo drops it to 25 ms before measuring anything.
 
-## Correctness measured in CI
+## Verification
 
 The unit tests cover the gates and the bundle encoding. The integration tests do something more useful: CI starts a real `solana-test-validator` on every push and runs the pipeline against it, landing actual transactions and asserting that each gate rejects before submission when it should.
 
 That design earned its keep on the first run. The gates all failed closed with "fee unavailable: blockhash no longer valid," because `Message::new` leaves the blockhash zeroed and `getFeeForMessage` prices the wire bytes it is handed; the fix is `Message::new_with_blockhash`. A mocked RPC would have returned a cheerful fee and shipped the bug.
 
-## No `solana-client`
+## Why no `solana-client`
 
 This crate talks JSON-RPC directly over the same HTTP client the Jito block engine uses. Seven calls, about 200 lines, in `src/rpc.rs`.
 
 Two reasons. `solana-client` drags the full RPC stack (websockets, transaction-status types, the parsed-transaction tree) into a dependency tree whose job is submitting one transaction. And as of Solana 4.x the stable release resolves `solana-transaction-status-client-types` against `wincode` 0.5 while `solana-sdk`'s own types implement the traits from `wincode` 0.6, so the two do not compile together; only pre-release versions fix it. Speaking the protocol directly sidesteps a class of problem instead of pinning around one instance of it.
 
-## What this is not
+## Weak spots
 
-There is no strategy here. No signals, no alpha, no opinion about what you should send: it is the execution machinery, extracted and rebuilt from [flowpilot](https://github.com/ampactor-labs/flowpilot), a Solana trading engine I retired when its edge stopped clearing fees. The strategy died on the evidence. The engineering was worth keeping.
+The published latency table is a local validator, so it characterizes this crate and says nothing about a real cluster. Until someone posts devnet or mainnet numbers, treat the confirm row as a slot time rather than a network measurement.
+
+Bundles carry exactly one transaction. `JitoClient::build_bundle` validates up to the block engine's limit of five, but `Pipeline::run` submits a single signed transaction plus its tip, so the atomic multi-transaction case that makes bundles interesting is not wired up yet.
+
+Priority fees are not a gate input. `FeeCeiling` sees the base fee for the message; a compute-unit price set through a `ComputeBudget` instruction passes unexamined.
+
+An `Expired` outcome is where the pipeline stops. It tells you the blockhash died and the transaction can never land, and then hands the rebuild back to you rather than retrying on a fresh one.
+
+And there is no strategy here. No signals, no alpha, no opinion about what you should send: this is the execution machinery, extracted and rebuilt from [flowpilot](https://github.com/ampactor-labs/flowpilot), a Solana trading engine I retired when its edge stopped clearing fees. The strategy died on the evidence. The engineering was worth keeping.
 
 ## License
 
