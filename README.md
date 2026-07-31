@@ -31,7 +31,9 @@ That rule has a sharp edge, on purpose. `ComputeCeiling` rejects when the RPC re
 
 ```rust
 use landed::{BalanceFloor, ComputeCeiling, FeeCeiling, Pipeline, Route, SimulationMustPass};
+use solana_sdk::{instruction::Instruction, signature::Keypair};
 
+# async fn demo(instructions: Vec<Instruction>, payer: Keypair) -> landed::Result<()> {
 let pipeline = Pipeline::new("https://api.mainnet-beta.solana.com")
     .with_jito("https://mainnet.block-engine.jito.wtf")
     .with_gate(SimulationMustPass)
@@ -48,6 +50,8 @@ let flight = pipeline
     .await?;
 
 println!("{:?} after {:?}", flight.outcome, flight.timing.total());
+# Ok(())
+# }
 ```
 
 Writing your own gate is one method:

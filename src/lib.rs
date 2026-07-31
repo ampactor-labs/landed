@@ -60,3 +60,9 @@ pub use pipeline::{Pipeline, PipelineConfig};
 pub use rpc::{Commitment, RpcClient, SignatureStatus};
 pub use submit::{tip_instruction, BundleStatus, JitoClient, Route, TIP_ACCOUNTS};
 pub use track::{Flight, Outcome, Timing};
+
+/// Compiles every Rust code block in the README under `cargo test`, so a
+/// drifting example fails the build instead of misleading a reader.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
