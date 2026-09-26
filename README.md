@@ -5,31 +5,20 @@
 [![CI](https://github.com/ampactor-labs/landed/actions/workflows/ci.yml/badge.svg)](https://github.com/ampactor-labs/landed/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/landed.svg)](#license)
 
-Fail-closed Solana transaction execution: plan it, gate it, submit it by RPC or Jito bundle, and know what happened.
+A Rust library that sends a Solana blockchain transaction only after live checks approve it, then reports whether it landed and how long each stage took. It submits through an RPC node (a Solana server that takes JSON requests over HTTP) or as a Jito bundle (a tipped submission relayed to the validators that produce blocks). A check that cannot get its data rejects the transaction. It is built on solana-sdk 4 and tokio, and CI tests it against a local validator.
+
+**Status: working.** The API may change before 1.0, priority fees are not a gate input yet, and an expired transaction is left to the caller to rebuild.
+
+Package: https://crates.io/crates/landed · Docs: https://docs.rs/landed
+
+## Usage
 
 ```toml
 [dependencies]
 landed = "0.1"
 ```
 
-**Status: working, API unstable.** 0.1.0 is on crates.io. Priority fees are not a gate input yet, and an `Expired` flight is the caller's to rebuild.
-
-```text
-assemble ──► gate ──► submit ──► track
- blockhash    balance   RPC or    signature status
- (+ tip)      fee       Jito      bundle status
- sign         simulate  bundle    blockhash expiry
-```
-
-Every stage is timed. What comes back is a `Flight`: the outcome (`Landed { slot }`, `Expired`, or `Failed { reason }`) and where the milliseconds went.
-
-## The law
-
-A transaction is submitted only after every gate approves. Gates read a context the pipeline assembles from live chain state (balance, fee, simulation result), and if any of that evidence cannot be fetched, the transaction is rejected rather than submitted with the check skipped. Unknown is not safe.
-
-That rule has a sharp edge, on purpose. `ComputeCeiling` rejects when the RPC reports no compute consumption at all, because "the node didn't tell me" and "it fits in budget" are different facts and only one of them is safe to act on.
-
-## Usage
+Build a `Pipeline` from an RPC URL, add gates (the checks), and call `run` with the transaction's instructions (the program calls it makes) and the payer's keypair. `run` returns a `Flight`: the outcome (`Landed { slot }`, `Expired` or `Failed { reason }`) and the time spent in each stage. When a gate rejects, `run` returns `Err(Error::Rejected(..))` with the gate's name and reason, and nothing is sent. Amounts are in lamports (the smallest unit of SOL, Solana's currency).
 
 ```rust
 use landed::{BalanceFloor, ComputeCeiling, FeeCeiling, Pipeline, Route, SimulationMustPass};
@@ -56,7 +45,21 @@ println!("{:?} after {:?}", flight.outcome, flight.timing.total());
 # }
 ```
 
-Writing your own gate is one method:
+### Built-in gates
+
+Gates run in the order you add them, and the first rejection stops the run. A pipeline with no gates submits anything it can sign.
+
+| Gate                 | Rejects when                                                                                                    |
+| -------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `SimulationMustPass` | the simulation run before submission returned an error                                                          |
+| `ComputeCeiling(n)`  | the simulation used more than `n` compute units (Solana's measure of a transaction's work), or reported no usage |
+| `FeeCeiling(n)`      | the network fee for the message is above `n` lamports                                                           |
+| `TipCeiling(n)`      | the Jito tip is above `n` lamports (a tip of 0, as on the RPC route, always passes)                              |
+| `BalanceFloor(n)`    | paying the fee and the tip would leave the payer with less than `n` lamports                                    |
+
+### Writing a gate
+
+A gate is a trait with two methods:
 
 ```rust
 struct MarketHours;
@@ -70,52 +73,113 @@ impl landed::Gate for MarketHours {
 }
 ```
 
-## Measured
+`GateCtx` holds the signed transaction, the payer, its balance, the fee, the tip and the simulation result (error, compute units and logs).
 
-50 gated self-transfers through the RPC route against a local `solana-test-validator`, polling at 25 ms (`cargo run --release --example demo`):
+### Settings
 
-| stage | p50 ms | p90 ms | p99 ms |
-|---|---|---|---|
-| assemble | 0.2 | 0.3 | 1.0 |
-| gate | 0.6 | 1.0 | 2.8 |
-| submit | 0.2 | 0.2 | 1.0 |
-| confirm | 427.4 | 429.3 | 512.9 |
-| total | 428.4 | 430.7 | 517.8 |
+`Pipeline::with_config` takes a `PipelineConfig` with three fields. `commitment` is how final a transaction must be before it counts as landed (`Processed`, `Confirmed` or `Finalized`; default `Confirmed`). `poll_interval` is how often tracking polls (default 400 ms). `deadline` caps tracking (default 90 s); past it the flight is `Failed`.
 
-50 landed, 0 expired, 0 failed, 0 rejected.
+## How it works
 
-Read that table for the shape, not the absolute numbers. A local validator measures this crate's own overhead, about a millisecond of assemble, gate, and submit combined across three RPC round trips of which the simulation dominates; `confirm` is just the test validator's slot time. On a real cluster the first three rows grow with your RPC latency and the fourth is the network's business, not this crate's. Point the demo at devnet with your own keypair to see numbers that generalize:
+```text
+assemble ──► gate ──► submit ──► track
+ blockhash    balance   RPC or    signature status
+ (+ tip)      fee       Jito      bundle status
+ sign         simulate  bundle    blockhash expiry
+```
+
+`Pipeline::run` takes one transaction through four timed stages:
+
+1. **Assemble** fetches a recent blockhash (the hash of a recent block, which every transaction must carry and which expires soon after), appends the tip transfer on the Jito route, and signs. The tip goes to one of Jito's eight official tip accounts, picked by a timestamp hash to spread load.
+2. **Gate** fetches the payer's balance, prices the message with `getFeeForMessage`, simulates the signed transaction, and runs every gate over the result.
+3. **Submit** calls `sendTransaction` with the node's own preflight simulation skipped (the gate stage already simulated), or encodes a bundle and posts it to the block engine's `sendBundle`.
+4. **Track** polls the signature status until it reaches the configured commitment (`Landed`) or reports an error (`Failed`). On the bundle route it also asks the block engine for an early `Landed`, `Failed` or `Invalid`, and carries on if that call errors. If the blockhash expires first the outcome is `Expired`, and past the deadline it is `Failed`.
+
+### Fail-closed gates
+
+A transaction is submitted only after every gate approves. Gates are pure functions over a `GateCtx` that the pipeline builds from live chain state before any gate runs. If the balance, the fee or the simulation cannot be fetched, the pipeline rejects the transaction (gate name `context`) and runs no gates. I chose this because an unknown value is not a safe value.
+
+`ComputeCeiling` shows the sharp edge of that rule. It rejects when the node reports no compute usage at all, because "the node did not say" and "it fits the budget" are different facts, and only the second is safe to act on.
+
+### Why it speaks JSON-RPC directly
+
+`src/rpc.rs` is a small JSON-RPC client: the seven methods the pipeline calls, plus `requestAirdrop` for tests, in about 250 lines of code. The Jito client in `src/submit.rs` uses the same HTTP client (`reqwest`). I left out `solana-client` for two reasons. It brings the full RPC stack (websockets, transaction-status types, the parsed-transaction tree) into a crate whose job is to submit one transaction. And when I wrote this (July 2026), its stable 4.x release resolved `solana-transaction-status-client-types` against version 0.5 of the `wincode` serialization crate, while `solana-sdk`'s own types implement the traits from `wincode` 0.6, so the two did not compile together. `solana-client` 4.3.0 (September 2026) resolves `wincode` 0.6; whether it now builds alongside this crate is untested.
+
+## Benchmarks
+
+`examples/demo.rs` sends 50 gated self-transfers (the payer sends 1,000 lamports to itself) through the RPC route to a local `solana-test-validator`, polls every 25 ms, and prints per-stage percentiles.
+
+```sh
+solana-test-validator --quiet --reset &
+cargo run --release --example demo
+```
+
+The table shows two runs, in milliseconds. The earlier run is from the first version of this README, and its hardware was not recorded. The rerun is from 2026-09-26, in a cloud container with 4 vCPUs (Intel Xeon at 2.8 GHz), using `solana-test-validator` from Agave 4.2.2 (the Solana validator software). Both runs landed all 50 transactions, with none expired, failed or rejected.
+
+| stage    | earlier p50 | earlier p90 | earlier p99 | rerun p50 | rerun p90 | rerun p99 |
+| -------- | ----------- | ----------- | ----------- | --------- | --------- | --------- |
+| assemble | 0.2         | 0.3         | 1.0         | 0.3       | 0.5       | 0.7       |
+| gate     | 0.6         | 1.0         | 2.8         | 1.0       | 1.8       | 5.4       |
+| submit   | 0.2         | 0.2         | 1.0         | 0.3       | 0.5       | 2.5       |
+| confirm  | 427.4       | 429.3       | 512.9       | 435.3     | 491.0     | 518.4     |
+| total    | 428.4       | 430.7       | 517.8       | 437.0     | 492.8     | 520.6     |
+
+Read this table for its shape. A local validator measures this crate's own overhead: assemble, gate and submit together take one to two milliseconds at the median, across five RPC calls (three of them in the gate stage). `confirm` is mostly the test validator's slot time (a slot is Solana's block interval). On a real cluster the first three rows grow with your RPC latency, and the confirm row depends on the network. To see numbers that generalize, point the demo at devnet (Solana's public test network) with your own funded keypair:
 
 ```sh
 cargo run --release --example demo -- https://api.devnet.solana.com 25 ~/.config/solana/id.json
 ```
 
-Poll interval is worth a word, since it is the one knob that can lie to you. The default is 400 ms; at that setting the reported confirm time is the poll granularity rather than the cluster's, which is why the demo drops it to 25 ms before measuring anything.
+The poll interval can distort the confirm row. At the 400 ms default, that row measures the poll granularity, so the demo sets the interval to 25 ms before measuring.
 
-## Verification
+## Project layout
 
-The unit tests cover the gates and the bundle encoding. The integration tests do something more useful: CI starts a real `solana-test-validator` on every push and runs the pipeline against it, landing actual transactions and asserting that each gate rejects before submission when it should.
+```text
+src/pipeline.rs     the four stages and the tracking loop
+src/gate.rs         Gate trait, GateCtx and the built-in gates
+src/rpc.rs          JSON-RPC client for the Solana node
+src/submit.rs       Route, the Jito block engine client and tip accounts
+src/track.rs        Flight, Outcome and Timing
+src/metrics.rs      percentile report used by the demo
+examples/demo.rs    the latency run behind Benchmarks
+tests/validator.rs  integration tests against a live validator
+```
 
-That design earned its keep on the first run. The gates all failed closed with "fee unavailable: blockhash no longer valid," because `Message::new` leaves the blockhash zeroed and `getFeeForMessage` prices the wire bytes it is handed; the fix is `Message::new_with_blockhash`. A mocked RPC would have returned a cheerful fee and shipped the bug.
+## Testing
 
-## Why no `solana-client`
+```sh
+cargo test
+```
 
-This crate talks JSON-RPC directly over the same HTTP client the Jito block engine uses. Seven calls, about 200 lines, in `src/rpc.rs`.
+This runs 23 unit tests (gates, bundle encoding, tip accounts, commitment handling, timing and percentiles). It also compiles the example in `src/lib.rs` and every Rust block in this README, which `src/lib.rs` includes as doctests. The integration tests skip themselves unless `LANDED_RPC_URL` is set.
 
-Two reasons. `solana-client` drags the full RPC stack (websockets, transaction-status types, the parsed-transaction tree) into a dependency tree whose job is submitting one transaction. And as of Solana 4.x the stable release resolves `solana-transaction-status-client-types` against `wincode` 0.5 while `solana-sdk`'s own types implement the traits from `wincode` 0.6, so the two do not compile together; only pre-release versions fix it. Speaking the protocol directly sidesteps a class of problem instead of pinning around one instance of it.
+The integration tests in `tests/validator.rs` run the pipeline against a real validator:
 
-## Weak spots
+```sh
+solana-test-validator --quiet --reset &
+LANDED_RPC_URL=http://127.0.0.1:8899 cargo test --test validator -- --nocapture
+```
 
-The published latency table is a local validator, so it characterizes this crate and says nothing about a real cluster. Until someone posts devnet or mainnet numbers, treat the confirm row as a slot time rather than a network measurement.
+They land a gated self-transfer, check that `FeeCeiling` and `BalanceFloor` reject before submission, check that an unfunded payer is stopped at simulation, and check that the bundle route refuses to run without a block engine.
 
-Bundles carry exactly one transaction. `JitoClient::build_bundle` validates up to the block engine's limit of five, but `Pipeline::run` submits a single signed transaction plus its tip, so the atomic multi-transaction case that makes bundles interesting is not wired up yet.
+CI (`.github/workflows/ci.yml`) runs on every push to master and every pull request. One job runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test`. A second job installs the Agave toolchain, starts `solana-test-validator` and runs the integration tests against it.
 
-Priority fees are not a gate input. `FeeCeiling` sees the base fee for the message; a compute-unit price set through a `ComputeBudget` instruction passes unexamined.
+Nothing tests the Jito route against a real or mocked block engine, so `sendBundle` and `getBundleStatuses` are unexercised. The `Expired` outcome and the tracking deadline have no test, and the `TipCeiling` unit test covers only the zero tip of the RPC route.
 
-An `Expired` outcome is where the pipeline stops. It tells you the blockhash died and the transaction can never land, and then hands the rebuild back to you rather than retrying on a fresh one.
+### A bug the validator caught
 
-And there is no strategy here. No signals, no alpha, no opinion about what you should send: this is the execution machinery, extracted and rebuilt from [flowpilot](https://github.com/ampactor-labs/flowpilot), a Solana trading engine I retired when its edge stopped clearing fees. The strategy died on the evidence. The engineering was worth keeping.
+On the first run against the validator, every gate failed closed with "fee unavailable: blockhash no longer valid". `Message::new` leaves the blockhash zeroed, and `getFeeForMessage` prices the exact bytes it is given, so the node returned no fee. The fix was `Message::new_with_blockhash`. A mocked RPC would have returned a fee and let the bug ship.
+
+## Limitations
+
+The latency numbers come from a local test validator, so they describe this library's overhead and say nothing about Solana's public networks. The Jito route puts one transaction in each bundle and has not been tested against a real block engine. Priority fees (the optional extra fee that buys earlier inclusion) pass the fee gate unchecked. When a transaction expires, the pipeline stops and leaves the rebuild to the caller.
+
+- **One transaction per bundle.** `JitoClient::build_bundle` accepts up to the block engine's limit of five transactions, but `Pipeline::run` submits one signed transaction with its tip. Multi-transaction bundles, where several transactions land together or not at all, are not wired up.
+- **Priority fees are not a gate input.** `FeeCeiling` sees the base fee for the message. A compute-unit price set through a `ComputeBudget` instruction passes unexamined.
+- **`Expired` ends the run.** The outcome means the blockhash died and the transaction can never land. The pipeline does not retry on a fresh blockhash.
+- **`BalanceFloor` counts only the fee and the tip.** Lamports that the instructions themselves move are not modeled, so the floor has to cover them.
+- **No strategy.** The crate holds no trading signals and makes no decision about what to send. This is the execution code from [flowpilot](https://github.com/ampactor-labs/flowpilot), a Solana trading engine I retired when its edge stopped covering fees, extracted and rebuilt.
 
 ## License
 
-MIT or Apache 2.0, at your option.
+Licensed under either the [MIT license](LICENSE-MIT) or the [Apache License 2.0](LICENSE-APACHE), at your option. `Cargo.toml` declares `MIT OR Apache-2.0`.
